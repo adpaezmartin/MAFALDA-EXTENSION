@@ -1,12 +1,12 @@
-/** content.js — FOSXpress v3.7.1
+/** content.js — FOSXpress v3.7.1 (+ PDF collector)
  *  - Snippets + placeholders + diálogo + typeahead + soporte mail
  *  - Detección CDU (challenge) + SITE (país) desde el DOM → background/storage
  *  - Gatillo “maf” → toma el texto escrito antes del token, abre panel IA,
  *    valida casuística contra guía (vía Apps Script) y propone mensaje final.
- *  - NUEVO: analyzeWithAI usa background (evita CORS).
+ *  - NUEVO: analyzeWithAI usa background (evita CORS) y ahora envía attachments (PDFs).
  */
 
-console.log("[FOSXpress] content script v3.7.1 loaded");
+console.log("[FOSXpress] content script v3.7.1 + pdf collector loaded");
 
 /* ================ Silenciar SOLO el error de contexto invalidado ================= */
 function isContextInvalidatedMsg(msg){
@@ -1026,18 +1026,106 @@ function normalizeAppsScriptUrl(u){
   );
 }
 
-/** Llama al background para que haga el fetch a Apps Script (evita CORS) */
-async function analyzeWithAI(freeText){
+/* ========= NUEVO: Helpers para detectar PDFs en Checker ========= */
+function absoluteUrl(url){
+  try{ return new URL(url, location.href).toString(); } catch{ return url||""; }
+}
+function getRawSrc(el){ return el?.getAttribute?.("src") || el?.getAttribute?.("href") || ""; }
+const __pad2 = (n)=> String(n).padStart(2,"0");
+
+function normalizeToSecureUrl(raw){
+  const abs = absoluteUrl(raw); if(!abs) return null;
+  const lower = abs.toLowerCase();
+  if (lower.includes("/api/iv/getpdf")) return abs;
+  if (lower.startsWith("http://")) {
+    return `https://kyc-checker.adminml.com/api/iv/getPdf?url=${encodeURIComponent(abs)}`;
+  }
+  if (lower.startsWith("https://") && /\.pdf(\?|$)/i.test(lower)) return abs;
+  try{
+    const u = new URL(abs);
+    const alt = u.searchParams.get("url") || u.searchParams.get("doc") || u.searchParams.get("file");
+    if (alt) return normalizeToSecureUrl(alt);
+  }catch{}
+  return `https://kyc-checker.adminml.com/api/iv/getPdf?url=${encodeURIComponent(abs)}`;
+}
+
+function detectCaseId(){
+  const m = location.pathname.match(/\/case\/(\d+)/);
+  if (m?.[1]) return m[1];
+  const q = new URLSearchParams(location.search);
+  const qp = q.get("case") || q.get("case_id") || q.get("challengeId") || q.get("id");
+  if (qp && /^\d{6,15}$/.test(qp)) return qp;
+  return "UNKNOWN";
+}
+function suggestFileName(raw, idx, caseId){
+  try{
+    const u = new URL(absoluteUrl(raw));
+    const nameParam = u.searchParams.get("name");
+    const base = nameParam || (u.pathname.split("/").pop() || "documento");
+    const name = /\.pdf$/i.test(base) ? base : `${base}.pdf`;
+    return `CASE_${caseId}__${__pad2(idx+1)}__${name}`;
+  }catch{
+    return `CASE_${caseId}__${__pad2(idx+1)}__documento.pdf`;
+  }
+}
+
+function isPdfLikeEl(el){
+  const type = (el.getAttribute?.("type") || "").toLowerCase();
+  const raw  = getRawSrc(el); const src = (raw || "").toLowerCase();
+  if (!raw) return false;
+  if (src.includes("/api/iv/getpdf")) return true;
+  if (src.includes("kyc-documents.adminml.com") && src.includes(".pdf")) return true;
+  if (type.includes("application/pdf")) return true;
+  const tag = el.tagName?.toLowerCase();
+  if ((tag==="embed" || tag==="object") && (type.includes("pdf") || /\.pdf(\?|$)/i.test(src))) return true;
+  if (tag==="iframe" && (src.includes("pdf") || src.includes("viewer") || src.includes("file="))) return true;
+  return false;
+}
+
+function collectKycPdfTargets(){
+  const caseId = detectCaseId();
+  const els = Array.from(document.querySelectorAll("iframe,embed,object,a[href]"));
+  const seen = new Set();
+  const items = [];
+  let idx = 0;
+  for (const el of els){
+    if (!isPdfLikeEl(el)) continue;
+    const raw = getRawSrc(el);
+    const url = normalizeToSecureUrl(raw);
+    if (!url) continue;
+    const key = url.split("#")[0];
+    if (seen.has(key)) continue;
+    seen.add(key);
+    items.push({ url, name: suggestFileName(raw, idx++, caseId) });
+  }
+  return items;
+}
+
+/** Llama al background para que haga el fetch a Apps Script (evita CORS)
+ *  NUEVO: acepta objeto { text, site?, cdu?, attachments? }.
+ */
+async function analyzeWithAI(arg){
+  // Compatibilidad: si vienen solo "freeText" (string), lo convertimos
+  const payload = (typeof arg === "string") ? { text: arg } : (arg || {});
   const cdu  = await storageGetSafe("maf_challenge", null);
   const site = await storageGetSafe("maf_site", null);
   const remoteRaw = await storageGetLocal("remote_url", "");
   const remote = normalizeAppsScriptUrl(remoteRaw || "");
   if(!remote) throw new Error('Falta configurar la "Fuente remota" en el popup');
 
+  const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
+
   return await new Promise((resolve, reject) => {
     try {
       chrome.runtime.sendMessage(
-        { type: "maf:ai_analyze", remoteUrl: remote, text: freeText, cdu: cdu || null, site: site || null },
+        {
+          type: "maf:ai_analyze",
+          remoteUrl: remote,
+          text: String(payload.text || ""),
+          cdu: String(payload.cdu || cdu || ""),
+          site: String(payload.site || site || ""),
+          attachments
+        },
         (res) => {
           if (chrome.runtime.lastError) return reject(chrome.runtime.lastError);
           if (!res || res.ok === false) return reject(new Error(res?.error || "No se pudo analizar el texto."));
@@ -1134,12 +1222,20 @@ function openMafPanel(freeText, ctxForInsert){
 
   (async ()=>{
     try{
-      const res = await analyzeWithAI(freeText);
+      // 1) Detectar PDFs del caso (no descarga en browser)
+      const attachments = collectKycPdfTargets(); // [{url,name}, ...]
+
+      // 2) Llamar a IA pasando texto + attachments
+      const res = await analyzeWithAI({ text: freeText, attachments });
+
       const ok = !!res.isAllowed;
       const items = Array.isArray(res.detected) ? res.detected : (res.detected ? [res.detected] : []);
       detEl.innerHTML = `
         <div>${items.length ? items.map(x=>`• ${escapeHTML(String(x))}`).join("<br>") : "—"}</div>
         <div style="margin-top:6px">${ok ? '<span class="ok">✔ Correcto</span>' : '<span class="bad">✖ Incorrecto</span>'}</div>
+        <div style="margin-top:6px; font-size:12px; color:#555">
+          Adjuntos enviados: ${attachments.length ? attachments.map(a=>escapeHTML(a.name)).join(", ") : "ninguno"}
+        </div>
       `;
       if (res.improved) finalEl.textContent = res.improved;
       finalEl.focus();
@@ -1165,3 +1261,4 @@ function maybeHandleMaf(e){
   openMafPanel(freeText, ctx);
   return true;
 }
+
