@@ -1,40 +1,43 @@
 {
-  "name": "Mafalda",
-  "description": "Insertá respuestas con atajos (snippets) y campos dinámicos. Macros de fecha y typeahead.",
-  "version": "1.0.1",
   "manifest_version": 3,
-
-  "permissions": ["storage"],
+  "name": "Mafalda",
+  "version": "3.7.1",
+  "description": "Asistente para redactar mensajes MELI apoyado en guía + OpenAI y análisis de adjuntos.",
+  "permissions": [
+    "storage"
+  ],
   "host_permissions": [
     "https://script.google.com/*"
   ],
-
   "background": {
     "service_worker": "background.js"
   },
-
   "action": {
+    "default_title": "Mafalda",
     "default_popup": "popup.html",
     "default_icon": {
-      "16": "icons/icon16.png",
-      "32": "icons/icon32.png",
-      "48": "icons/icon48.png"
-    },
-    "default_title": "Mafalda"
+      "16": "icon16.png",
+      "32": "icon32.png",
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
   },
-
   "icons": {
-    "16": "icons/icon16.png",
-    "32": "icons/icon32.png",
-    "48": "icons/icon48.png",
-    "128": "icons/icon128.png"
+    "16": "icon16.png",
+    "32": "icon32.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
   },
-
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"],
-      "run_at": "document_start"
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_end"
     }
   ]
 }
+
